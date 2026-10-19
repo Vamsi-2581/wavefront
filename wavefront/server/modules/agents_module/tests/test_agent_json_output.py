@@ -16,6 +16,7 @@ from agents_module.services.agent_inference_service import AgentInferenceService
 
 @pytest.fixture
 def inference_api():
+    """Build an isolated v2 API with real agent execution and a mocked model."""
     llm = Mock(spec=BaseLLM)
     llm.generate = AsyncMock()
     llm.get_message_content.side_effect = lambda response: response
@@ -23,6 +24,7 @@ def inference_api():
     service.prepare_agent_v2 = AsyncMock()
 
     async def perform(**kwargs):
+        """Run the model-backed inference while replacing storage and lookup."""
         agent, namespace, name = await service.prepare_agent_v2()
         result, elapsed = await service.run_agent_inference(
             agent,
@@ -50,6 +52,7 @@ def inference_api():
 
 
 def reply(service, llm, content, output_schema=None):
+    """Configure the next model reply and optional parser schema."""
     llm.generate.return_value = content
     agent = Agent(
         name='test',
@@ -62,6 +65,7 @@ def reply(service, llm, content, output_schema=None):
 
 @pytest.mark.parametrize('content', ['The customer is Alice.', '', '{broken json}'])
 def test_missing_json_fails(inference_api, content):
+    """Reject replies without an extractable object using the default mode."""
     client, service, llm = inference_api
     reply(service, llm, content)
     response = client.post(
@@ -86,6 +90,7 @@ def test_missing_json_fails(inference_api, content):
     ],
 )
 def test_valid_json_preserved(inference_api, content, expected):
+    """Keep all supported JSON object extraction forms."""
     client, service, llm = inference_api
     reply(service, llm, content)
     response = client.post(
@@ -96,6 +101,7 @@ def test_valid_json_preserved(inference_api, content, expected):
 
 
 def test_plain_text_mode_preserved(inference_api):
+    """Return the original reply when JSON output is disabled."""
     client, service, llm = inference_api
     content = 'The customer is Alice.'
     reply(service, llm, content)
@@ -108,6 +114,7 @@ def test_plain_text_mode_preserved(inference_api):
 
 
 def test_parser_output_preserved(inference_api):
+    """Preserve the configured output schema and parsed model result."""
     client, service, llm = inference_api
     schema = {'type': 'object', 'properties': {'name': {'type': 'string'}}}
     reply(service, llm, '{"name": "Alice"}', output_schema=schema)
