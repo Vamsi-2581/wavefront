@@ -84,6 +84,69 @@ class TestSampleVideoFrames:
         # Distinct source frames, not the first frame repeated.
         assert len({png for _, png in frames}) == 4
 
+    def test_durationless_video_uses_packet_timestamps_without_seeking(self, monkeypatch):
+        import sys
+        from fractions import Fraction
+        from types import SimpleNamespace
+
+        class FakeStream:
+            time_base = Fraction(1, 1000)
+            start_time = 0
+            duration = None
+
+        class FakeFrame:
+            time_base = Fraction(1, 1000)
+
+            def __init__(self, pts):
+                self.pts = pts
+                self.time = pts / 1000
+
+        class FakeContainer:
+            duration = None
+
+            def __init__(self):
+                self.streams = SimpleNamespace(video=[FakeStream()])
+                self.seek_called = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def demux(self, _stream):
+                return [SimpleNamespace(pts=pts) for pts in range(0, 9001, 1000)]
+
+            def decode(self, _stream):
+                return [FakeFrame(pts) for pts in range(0, 9001, 1000)]
+
+            def seek(self, *_args, **_kwargs):
+                self.seek_called = True
+                raise AssertionError('durationless videos must be decoded sequentially')
+
+        containers = []
+
+        def open_video(_buffer):
+            container = FakeContainer()
+            containers.append(container)
+            return container
+
+        monkeypatch.setitem(sys.modules, 'av', SimpleNamespace(open=open_video))
+        monkeypatch.setattr(
+            video_frames,
+            '_frame_to_png',
+            lambda frame, _pymupdf: str(frame.pts).encode(),
+        )
+
+        frames = sample_video_frames(b'durationless webm', 8)
+
+        assert len(containers) == 2  # one demux pass, one sequential decode pass
+        assert all(not container.seek_called for container in containers)
+        assert [int(png) for _, png in frames] == list(range(1000, 9000, 1000))
+        assert [time for time, _ in frames] == pytest.approx(
+            [9 * (i + 0.5) / 8 for i in range(8)]
+        )
+
     def test_large_frames_are_downscaled(self):
         import pymupdf
 

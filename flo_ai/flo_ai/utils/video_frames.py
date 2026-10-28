@@ -2,7 +2,10 @@
 
 import base64 as _base64
 import io
+import logging
 from typing import TYPE_CHECKING, List, Tuple
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from flo_ai.models.chat_message import VideoMessageContent
@@ -59,13 +62,31 @@ def sample_video_frames(data: bytes, max_frames: int) -> List[Tuple[float, bytes
         else:
             duration = 0.0
 
+        if duration <= 0:
+            # WebM recordings made by MediaRecorder commonly omit both duration
+            # fields. Demux packet timestamps to estimate the end, then decode
+            # sequentially; seeking such a file often returns only its first
+            # frame because it has no cue table.
+            last_pts = None
+            for packet in container.demux(stream):
+                if packet.pts is not None and (last_pts is None or packet.pts > last_pts):
+                    last_pts = packet.pts
+            if last_pts is not None and time_base is not None:
+                duration = max(0.0, float(last_pts * time_base) - start)
+
+            if duration > 0:
+                logger.warning(
+                    'Video duration metadata is missing; sampling frames by sequential decode'
+                )
+            else:
+                logger.warning(
+                    'Video duration and packet timestamps are unavailable; sampling the first decoded frame'
+                )
+            return _sample_durationless_frames(data, max_frames, start, duration, av, pymupdf)
+
         # Midpoints of equal slices, so a 1-frame sample is the middle of the
         # video rather than its (often black) first frame.
-        targets = (
-            [duration * (i + 0.5) / max_frames for i in range(max_frames)]
-            if duration > 0
-            else [0.0]
-        )
+        targets = [duration * (i + 0.5) / max_frames for i in range(max_frames)]
         frames: List[Tuple[float, bytes]] = []
         last_time = None
         for target in targets:
@@ -88,6 +109,71 @@ def sample_video_frames(data: bytes, max_frames: int) -> List[Tuple[float, bytes
         if not frames:
             raise ValueError('Could not decode any frames from the video')
         return frames
+
+
+def _sample_durationless_frames(
+    data: bytes,
+    max_frames: int,
+    start: float,
+    duration: float,
+    av,
+    pymupdf,
+) -> List[Tuple[float, bytes]]:
+    """Choose frames nearest evenly spaced targets without relying on seek cues."""
+    targets = (
+        [duration * (i + 0.5) / max_frames for i in range(max_frames)]
+        if duration > 0
+        else [0.0]
+    )
+    frames: List[Tuple[float, bytes]] = []
+    target_index = 0
+    previous = None
+    first_untimed = None
+    last_selected_time = None
+
+    with av.open(io.BytesIO(data)) as container:
+        stream = container.streams.video[0]
+        for frame in container.decode(stream):
+            frame_time = frame.time
+            if frame_time is None and frame.pts is not None and stream.time_base is not None:
+                frame_time = float(frame.pts * stream.time_base)
+            if frame_time is None:
+                # Some damaged or unusual streams expose no timestamps at all.
+                # Preserve the old one-frame fallback rather than failing the video.
+                if first_untimed is None:
+                    first_untimed = frame
+                continue
+
+            while (
+                target_index < len(targets)
+                and frame_time + 1e-6 >= start + targets[target_index]
+            ):
+                target_time = start + targets[target_index]
+                chosen = (
+                    (frame_time, frame)
+                    if previous is None
+                    or abs(frame_time - target_time) < abs(previous[0] - target_time)
+                    else previous
+                )
+                if last_selected_time is None or chosen[0] > last_selected_time:
+                    frames.append((targets[target_index], _frame_to_png(chosen[1], pymupdf)))
+                    last_selected_time = chosen[0]
+                target_index += 1
+            previous = (frame_time, frame)
+
+        # If the last target lies just beyond the final timestamp, the final
+        # frame stands in, matching the duration-known path's end behavior.
+        if target_index < len(targets) and previous is not None:
+            for target in targets[target_index:]:
+                if last_selected_time is None or previous[0] > last_selected_time:
+                    frames.append((target, _frame_to_png(previous[1], pymupdf)))
+                    last_selected_time = previous[0]
+
+    if not frames and first_untimed is not None:
+        frames.append((0.0, _frame_to_png(first_untimed, pymupdf)))
+    if not frames:
+        raise ValueError('Could not decode any frames from the video')
+    return frames
 
 
 def _frame_to_png(frame, pymupdf) -> bytes:
